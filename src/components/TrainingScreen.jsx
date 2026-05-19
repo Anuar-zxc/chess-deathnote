@@ -14,6 +14,21 @@ const BOARD_STYLES = {
   classic:   { lightSquare: '#f0d9b5', darkSquare: '#b58863',  correct: 'rgba(74,222,128,0.5)', wrong: 'rgba(239,68,68,0.5)' },
 }
 
+function findPlayableMove(moves, from, to) {
+  const directMove = moves.find((move) => move.from === from && move.to === to)
+  if (directMove) return directMove
+
+  const rookCastleTarget = {
+    e1: { h1: 'g1', a1: 'c1' },
+    e8: { h8: 'g8', a8: 'c8' },
+  }
+  const normalizedTo = rookCastleTarget[from]?.[to]
+  if (!normalizedTo) return null
+
+  return moves.find((move) => move.from === from && move.to === normalizedTo && move.flags.includes('k'))
+    || moves.find((move) => move.from === from && move.to === normalizedTo && move.flags.includes('q'))
+}
+
 function PuzzleBoard({ puzzle, onComplete, onFail }) {
   const { t, i18n } = useTranslation()
   const { theme } = useGameStore()
@@ -24,22 +39,21 @@ function PuzzleBoard({ puzzle, onComplete, onFail }) {
   const [showHint, setShowHint] = useState(false)
   const [done, setDone]         = useState(false)
   const styles = BOARD_STYLES[theme] || BOARD_STYLES.deathnote
-  const lang = i18n.language
+  const lang = (i18n.language || 'ru').split('-')[0]
 
   function onDrop(from, to) {
     if (done) return false
     const expected = puzzle.solution[moveIdx]
-    const actual   = from + to
 
-    // Try the move
     const moves = game.moves({ verbose: true })
-    const mObj = moves.find(x => x.from === from && x.to === to)
+    const mObj = findPlayableMove(moves, from, to)
     if (!mObj) return false
+    const actual = `${mObj.from}${mObj.to}${mObj.promotion || ''}`
     try {
-      game.move({ from, to, promotion: mObj.promotion ? 'q' : undefined })
+      game.move({ from: mObj.from, to: mObj.to, promotion: mObj.promotion || 'q' })
     } catch { return false }
 
-    if (actual === expected || from+to+'q' === expected) {
+    if (actual === expected || `${mObj.from}${mObj.to}` === expected) {
       setFen(game.fen())
       setFlash('correct')
       setTimeout(() => setFlash(null), 600)
@@ -55,7 +69,13 @@ function PuzzleBoard({ puzzle, onComplete, onFail }) {
             const respFrom = puzzle.solution[next].slice(0,2)
             const respTo   = puzzle.solution[next].slice(2,4)
             const promo    = puzzle.solution[next][4]
-            game.move({ from: respFrom, to: respTo, promotion: promo || 'q' })
+            const responseMove = findPlayableMove(game.moves({ verbose: true }), respFrom, respTo)
+            if (!responseMove) {
+              setFlash('wrong')
+              setTimeout(() => { setFlash(null); onFail() }, 800)
+              return
+            }
+            game.move({ from: responseMove.from, to: responseMove.to, promotion: promo || responseMove.promotion || 'q' })
             setFen(game.fen())
             setMoveIdx(next + 1)
           }, 500)
