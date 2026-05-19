@@ -27,8 +27,15 @@ const pageVariants = {
 }
 
 export default function App() {
-  const { screen } = useGameStore()
+  const { screen, setScreen } = useGameStore()
   const Screen = SCREENS[screen] || HomeScreen
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('room') && screen !== 'online') {
+      setScreen('online')
+    }
+  }, [screen, setScreen])
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: 'smooth' })

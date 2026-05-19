@@ -53,7 +53,7 @@ export default function HomeScreen() {
       label: t('home_play_online'),
       desc: { ru: 'Онлайн-матч с игроком по всему миру', en: 'Match against global players', kk: 'Әлем бойынша онлайн матч', zh: '全球在线对战' },
       action: () => setScreen('online'),
-      tier: 'pro',
+      tier: 'free',
       color: '#60a5fa',
     },
     {

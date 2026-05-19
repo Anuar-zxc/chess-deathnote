@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useCallback, useState, useEffect, useRef } from 'react'
 import { Chess } from 'chess.js'
 import { Chessboard } from 'react-chessboard'
 import { useTranslation } from 'react-i18next'
@@ -6,10 +6,26 @@ import { useGameStore } from '../store/useGameStore'
 import { motion, AnimatePresence } from 'framer-motion'
 import { NOIR_PIECES } from './NoirPieces'
 
-// Simulated online — peer-to-peer via shared localStorage (same-device demo)
-// In production replace with WebSocket / Socket.io
 function generateCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase()
+}
+
+function getClientId() {
+  try {
+    const params = new URLSearchParams(window.location.search)
+    if (params.get('room') && params.get('join') === '1') {
+      const guest = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      sessionStorage.setItem('dn-client-id', guest)
+      return guest
+    }
+    const saved = sessionStorage.getItem('dn-client-id')
+    if (saved) return saved
+    const next = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    sessionStorage.setItem('dn-client-id', next)
+    return next
+  } catch {
+    return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  }
 }
 
 const BOARD_STYLES = {
@@ -36,113 +52,198 @@ function findPlayableMove(moves, from, to) {
 
 export default function OnlineScreen() {
   const { t } = useTranslation()
-  const { plan, stats, theme, addWin, addLoss, addDraw } = useGameStore()
+  const { stats, theme, addWin, addLoss, addDraw } = useGameStore()
+  const initialRoomCode = new URLSearchParams(window.location.search).get('room')?.toUpperCase() || ''
   const [mode, setMode]         = useState('lobby') // lobby | create | join | playing | searching
   const [roomCode, setRoomCode] = useState('')
-  const [joinCode, setJoinCode] = useState('')
+  const [joinCode, setJoinCode] = useState(initialRoomCode)
   const [myColor, setMyColor]   = useState('w')
+  const [isSpectator, setIsSpectator] = useState(false)
   const [copied, setCopied]     = useState(false)
   const [game, setGame]         = useState(new Chess())
   const [fen, setFen]           = useState(new Chess().fen())
   const [lastMove, setLastMove] = useState(null)
   const [status, setStatus]     = useState('playing')
   const [history, setHistory]   = useState([])
+  const [clientId] = useState(getClientId)
+  const [roomSource, setRoomSource] = useState('api')
   const pollRef = useRef(null)
+  const autoJoinRef = useRef(false)
   const styles  = BOARD_STYLES[theme] || BOARD_STYLES.deathnote
 
-  // Poll for opponent moves
+  async function roomApi(payload) {
+    const response = await fetch('/api/rooms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, clientId }),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data.error || 'room_error')
+    return data
+  }
+
+  async function getRemoteRoom(code) {
+    const response = await fetch(`/api/rooms?code=${encodeURIComponent(code)}`)
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(data.error || 'room_error')
+    return data.room
+  }
+
+  function applyRoom(room) {
+    const g = new Chess(room.fen)
+    setFen(room.fen)
+    setGame(g)
+    setHistory(room.history || g.history({ verbose: true }))
+    if (room.lastMove) setLastMove(room.lastMove)
+    if (room.status === 'checkmate') setStatus('checkmate')
+    else if (room.status === 'stalemate') setStatus('stalemate')
+    else if (room.status === 'draw') setStatus('draw')
+    else setStatus(g.isCheck() ? 'check' : 'playing')
+  }
+
+  function localCreateRoom() {
+    const code = generateCode()
+    const g = new Chess()
+    localStorage.setItem(`dn-room-${code}`, JSON.stringify({
+      fen: g.fen(),
+      history: [],
+      turn: 'w',
+      lastMove: null,
+      status: 'waiting',
+      whiteClientId: clientId,
+      blackClientId: null,
+    }))
+    return { code, color: 'w', room: { code, fen: g.fen(), history: [], lastMove: null, status: 'waiting' } }
+  }
+
+  const localJoinRoom = useCallback((code) => {
+    const raw = localStorage.getItem(`dn-room-${code}`)
+    if (!raw) throw new Error('room_not_found')
+    const data = JSON.parse(raw)
+    let color = 'spectator'
+    if (data.whiteClientId === clientId) color = 'w'
+    else if (data.blackClientId === clientId) color = 'b'
+    else if (!data.blackClientId) {
+      data.blackClientId = clientId
+      data.status = 'playing'
+      color = 'b'
+    }
+    localStorage.setItem(`dn-room-${code}`, JSON.stringify(data))
+    return { color, room: { code, ...data } }
+  }, [clientId])
+
+  // Poll for opponent joins and moves.
   useEffect(() => {
-    if (mode !== 'playing') return
-    const interval = setInterval(() => {
-      const raw = localStorage.getItem(`dn-room-${roomCode}`)
-      if (!raw) return
-      const data = JSON.parse(raw)
-      const g2   = new Chess(data.fen)
-      if (data.fen !== fen) {
-        setFen(data.fen)
-        setGame(g2)
-        if (data.lastMove) setLastMove(data.lastMove)
-        if (g2.isCheckmate()) { setStatus('checkmate'); addLoss() }
-        else if (g2.isStalemate()) setStatus('stalemate')
-        else if (g2.isDraw()) { setStatus('draw'); addDraw() }
-        else setStatus(g2.isCheck() ? 'check' : 'playing')
+    if (mode !== 'playing' && mode !== 'create') return
+    const interval = setInterval(async () => {
+      try {
+        const room = roomSource === 'api'
+          ? await getRemoteRoom(roomCode)
+          : localJoinRoom(roomCode).room
+        if (mode === 'create' && room.blackConnected) {
+          setMode('playing')
+        }
+        if (room.fen !== fen || room.status !== status) {
+          applyRoom(room)
+          const g2 = new Chess(room.fen)
+          if (g2.isCheckmate() && g2.turn() === myColor) addLoss()
+          if (g2.isDraw()) addDraw()
+        }
+      } catch {
+        if (roomSource === 'api') {
+          setRoomSource('local')
+        }
       }
     }, 800)
     return () => clearInterval(interval)
-  }, [mode, fen, roomCode, addDraw, addLoss])
+  }, [mode, fen, roomCode, roomSource, status, myColor, localJoinRoom, addDraw, addLoss])
 
   useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current) }, [])
 
-  if (plan === 'free') {
-    return (
-      <div className="online-screen">
-        <div className="online-locked">
-          <div className="locked-icon">🌐</div>
-          <h2 className="screen-title">{t('online_title')}</h2>
-          <p className="locked-desc">{t('online_locked_desc')} <strong>Pro</strong>+</p>
-          <motion.button
-            className="upgrade-btn"
-            onClick={() => useGameStore.getState().setScreen('subscription')}
-            whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
-          >
-            👑 {t('sub_upgrade')} → Pro
-          </motion.button>
-        </div>
-      </div>
-    )
-  }
-
-  function createRoom() {
-    const code = generateCode()
-    setRoomCode(code)
-    setMyColor('w')
-    localStorage.setItem(`dn-room-${code}`, JSON.stringify({ fen: new Chess().fen(), turn: 'w', lastMove: null, status: 'waiting' }))
+  async function createRoom() {
+    let result
+    try {
+      result = await roomApi({ action: 'create' })
+      setRoomSource('api')
+    } catch {
+      result = localCreateRoom()
+      setRoomSource('local')
+    }
+    setRoomCode(result.room.code)
+    setJoinCode(result.room.code)
+    setMyColor(result.color)
+    setIsSpectator(false)
+    applyRoom(result.room)
+    window.history.replaceState(null, '', `?room=${result.room.code}`)
     setMode('create')
-    // Poll for opponent
-    pollRef.current = setInterval(() => {
-      const raw = localStorage.getItem(`dn-room-${code}`)
-      if (!raw) return
-      const data = JSON.parse(raw)
-      if (data.status === 'joined') { clearInterval(pollRef.current); setMode('playing') }
-    }, 1000)
   }
 
-  function joinRoom() {
+  async function joinRoom() {
     const code = joinCode.toUpperCase()
-    const raw  = localStorage.getItem(`dn-room-${code}`)
-    if (!raw) { alert(t('online_room_not_found')); return }
-    const data = JSON.parse(raw)
-    data.status = 'joined'
-    localStorage.setItem(`dn-room-${code}`, JSON.stringify(data))
+    let result
+    try {
+      result = await roomApi({ action: 'join', code })
+      setRoomSource('api')
+    } catch {
+      try {
+        result = localJoinRoom(code)
+        setRoomSource('local')
+      } catch {
+        alert(t('online_room_not_found'))
+        return
+      }
+    }
     setRoomCode(code)
-    setMyColor('b')
+    setMyColor(result.color === 'spectator' ? 'w' : result.color)
+    setIsSpectator(result.color === 'spectator')
+    applyRoom(result.room)
+    window.history.replaceState(null, '', `?room=${code}`)
     setMode('playing')
-    const g = new Chess(data.fen)
-    setGame(g); setFen(g.fen())
   }
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    if (!autoJoinRef.current && initialRoomCode && params.get('join') === '1' && mode === 'lobby') {
+      autoJoinRef.current = true
+      joinRoom()
+    }
+    // The invite handler should fire only once for the URL that mounted this screen.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialRoomCode, mode])
 
   function copyCode() {
-    navigator.clipboard.writeText(roomCode).catch(() => {})
+    const link = `${window.location.origin}${window.location.pathname}?room=${roomCode}&join=1`
+    navigator.clipboard.writeText(link).catch(() => navigator.clipboard.writeText(roomCode).catch(() => {}))
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
   }
 
-  function doMove(from, to) {
-    if (game.turn() !== myColor) return false
+  async function doMove(from, to) {
+    if (isSpectator || game.turn() !== myColor) return false
     const gc = new Chess(game.fen())
     const moves = gc.moves({ verbose: true })
     const m = findPlayableMove(moves, from, to)
     if (!m) return false
     try {
-      gc.move({ from: m.from, to: m.to, promotion: m.promotion ? 'q' : undefined })
+      if (roomSource === 'api') {
+        const result = await roomApi({ action: 'move', code: roomCode, from: m.from, to: m.to })
+        applyRoom(result.room)
+        if (result.room.status === 'checkmate') addWin()
+        if (result.room.status === 'draw') addDraw()
+        return true
+      }
+
+      gc.move({ from: m.from, to: m.to, promotion: m.promotion || 'q' })
       setGame(gc); setFen(gc.fen())
       setLastMove({ from: m.from, to: m.to })
       setHistory(gc.history({ verbose: true }))
-      // Save to "room"
       const raw  = localStorage.getItem(`dn-room-${roomCode}`)
       if (raw) {
         const data = JSON.parse(raw)
-        data.fen  = gc.fen(); data.lastMove = { from: m.from, to: m.to }
+        data.fen = gc.fen()
+        data.history = gc.history({ verbose: true })
+        data.lastMove = { from: m.from, to: m.to }
+        data.status = gc.isCheckmate() ? 'checkmate' : gc.isStalemate() ? 'stalemate' : gc.isDraw() ? 'draw' : 'playing'
         localStorage.setItem(`dn-room-${roomCode}`, JSON.stringify(data))
       }
       if (gc.isCheckmate()) {
@@ -205,10 +306,12 @@ export default function OnlineScreen() {
           </button>
         </div>
         <p style={{opacity:0.6, fontSize:'0.9rem'}}>{t('online_share_code')}</p>
+        <p style={{opacity:0.45, fontSize:'0.82rem'}}>Ссылка скопирует комнату для другого игрока: {window.location.origin}{window.location.pathname}?room={roomCode}&join=1</p>
         <div className="pulse-dots"><span/><span/><span/></div>
         <button className="action-btn" style={{marginTop:'1.5rem'}} onClick={() => {
           if (pollRef.current) clearInterval(pollRef.current)
           localStorage.removeItem(`dn-room-${roomCode}`)
+          window.history.replaceState(null, '', window.location.pathname)
           setMode('lobby')
         }}>✕ {t('online_cancel')}</button>
       </motion.div>
@@ -228,7 +331,7 @@ export default function OnlineScreen() {
         <div className="online-sidebar">
           <div className="online-info-box">
             <div className="oib-label">{t('online_you_play')}</div>
-            <div className="oib-color">{myColor === 'w' ? t('online_white') : t('online_black')}</div>
+            <div className="oib-color">{isSpectator ? 'Spectator' : myColor === 'w' ? t('online_white') : t('online_black')}</div>
           </div>
           <div className="online-info-box">
             <div className="oib-label">{t('online_room_code')}</div>
@@ -267,7 +370,10 @@ export default function OnlineScreen() {
               id: 'online-board',
               position: fen,
               pieces: NOIR_PIECES,
-              onPieceDrop: ({ sourceSquare, targetSquare }) => doMove(sourceSquare, targetSquare),
+              onPieceDrop: ({ sourceSquare, targetSquare }) => {
+                doMove(sourceSquare, targetSquare)
+                return true
+              },
               boardOrientation: myColor === 'b' ? 'black' : 'white',
               boardStyle: { borderRadius: '12px', boxShadow: '0 0 60px rgba(139,92,246,0.3)' },
               darkSquareStyle: { backgroundColor: styles.darkSquare },
